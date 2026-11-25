@@ -1,0 +1,358 @@
+Here is a JSON Schema (for validating endpoint/network configuration) and a Python script supporting changeable IP addresses, URLs, and DSN (Data Source Name) options—including CLI flags, environment variable overrides, and optional SHA-256 verification.
+
+1. Configuration JSON Schema (endpoint_dsn_config.schema.json)
+JSON
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/schemas/endpoint-dsn-config.schema.json",
+  "title": "Endpoint and DSN Configuration",
+  "description": "Schema for changeable IP address, URL endpoint, and DSN connection options.",
+  "type": "object",
+  "required": ["ip_address", "url", "dsn"],
+  "additionalProperties": true,
+  "properties": {
+    "ip_address": {
+      "type": "string",
+      "description": "Target IPv4 or IPv6 address (or hostname fallback).",
+      "pattern": "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 8080
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Full target URL (http, https, rtsp, ws, etc.)."
+    },
+    "dsn": {
+      "type": "object",
+      "description": "Data Source Name configuration with customizable connection options.",
+      "required": ["driver", "host", "database"],
+      "additionalProperties": false,
+      "properties": {
+        "driver": {
+          "type": "string",
+          "description": "Database or service driver (e.g., postgresql, mysql, sqlite, odbc, custom).",
+          "examples": ["postgresql", "mysql", "sqlite"]
+        },
+        "username": {
+          "type": "string",
+          "default": ""
+        },
+        "password": {
+          "type": "string",
+          "default": ""
+        },
+        "host": {
+          "type": "string",
+          "description": "DSN host; can track or override the top-level ip_address."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 5432
+        },
+        "database": {
+          "type": "string",
+          "description": "Database name or file path."
+        },
+        "options": {
+          "type": "object",
+          "description": "Key-value query/connection parameters appended to the DSN.",
+          "additionalProperties": {
+            "type": ["string", "integer", "number", "boolean"]
+          },
+          "default": {
+            "sslmode": "prefer",
+            "connect_timeout": 10
+          }
+        }
+      }
+    }
+  }
+}
+2. Python Script (endpoint_dsn_manager.py)
+This script loads a JSON config, validates it against the schema (if jsonschema is installed), lets you update IP, URL, and DSN options via CLI arguments or environment variables, builds the formatted DSN string, and saves the updated configuration.
+
+Python
+#!/usr/bin/env python3
+"""
+Manage and validate changeable IP address, URL, and DSN options.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+try:
+    import jsonschema  # type: ignore
+except ImportError:
+    jsonschema = None
+
+
+DEFAULT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["ip_address", "url", "dsn"],
+    "properties": {
+        "ip_address": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "url": {"type": "string", "minLength": 1},
+        "dsn": {
+            "type": "object",
+            "required": ["driver", "host", "database"],
+            "properties": {
+                "driver": {"type": "string", "minLength": 1},
+                "username": {"type": "string"},
+                "password": {"type": "string"},
+                "host": {"type": "string", "minLength": 1},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "database": {"type": "string", "minLength": 1},
+                "options": {"type": "object"},
+            },
+        },
+    },
+}
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "ip_address": "192.168.4.1",
+    "port": 8554,
+    "url": "http://192.168.4.1:8554/stream",
+    "dsn": {
+        "driver": "postgresql",
+        "username": "app_user",
+        "password": "",
+        "host": "192.168.4.1",
+        "port": 5432,
+        "database": "archive_db",
+        "options": {
+            "sslmode": "prefer",
+            "connect_timeout": 10,
+            "application_name": "endpoint_dsn_manager",
+        },
+    },
+}
+
+
+def parse_kv_options(pairs: list[str] | None) -> dict[str, Any]:
+    """Parse ['key=val', ...] CLI items into typed dict entries."""
+    parsed: dict[str, Any] = {}
+    if not pairs:
+        return parsed
+    for item in pairs:
+        if "=" not in item:
+            raise ValueError(f"Invalid option '{item}'. Expected key=value format.")
+        key, raw_val = item.split("=", 1)
+        key = key.strip()
+        val: Any = raw_val.strip()
+        if val.lower() in {"true", "false"}:
+            val = val.lower() == "true"
+        else:
+            try:
+                val = int(val)
+            except ValueError:
+                try:
+                    val = float(val)
+                except ValueError:
+                    pass
+        parsed[key] = val
+    return parsed
+
+
+def replace_url_host(url: str, new_host: str, new_port: int | None = None) -> str:
+    """Update host (and optional port) in a URL while preserving scheme, path, and query."""
+    parts = urlsplit(url)
+    port = new_port if new_port is not None else parts.port
+    netloc = f"{new_host}:{port}" if port else new_host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def build_dsn_uri(dsn: dict[str, Any]) -> str:
+    """Construct a DSN connection string from dsn fields and options."""
+    driver = dsn["driver"]
+    user = dsn.get("username", "")
+    password = dsn.get("password", "")
+    host = dsn["host"]
+    port = dsn.get("port")
+    database = dsn["database"]
+    options = dsn.get("options") or {}
+
+    if driver.lower() == "sqlite":
+        query = f"?{urlencode(options)}" if options else ""
+        return f"sqlite:///{database.lstrip('/')}{query}"
+
+    auth = ""
+    if user:
+        auth = f"{user}:{password}@" if password else f"{user}@"
+
+    host_part = f"{host}:{port}" if port else host
+    query = f"?{urlencode(options)}" if options else ""
+    return f"{driver}://{auth}{host_part}/{database.lstrip('/')}{query}"
+
+
+def validate_config(config: dict[str, Any], schema: dict[str, Any]) -> None:
+    """Validate configuration against JSON Schema if jsonschema is installed."""
+    if jsonschema is not None:
+        jsonschema.validate(instance=config, schema=schema)
+
+
+def sha256_payload(payload: dict[str, Any]) -> str:
+    """Return deterministic SHA-256 hex digest of canonical JSON."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Apply environment variables and CLI arguments onto config."""
+    ip = args.ip or os.getenv("TARGET_IP") or config["ip_address"]
+    url = args.url or os.getenv("TARGET_URL") or config["url"]
+    port = args.port if args.port is not None else config.get("port")
+
+    config["ip_address"] = ip
+    if port is not None:
+        config["port"] = port
+
+    if args.url or os.getenv("TARGET_URL"):
+        config["url"] = url
+    elif args.sync_url_ip or args.ip or args.port is not None:
+        config["url"] = replace_url_host(url, ip, port)
+
+    dsn = config.setdefault("dsn", {})
+    if args.dsn_driver:
+        dsn["driver"] = args.dsn_driver
+    if args.dsn_user is not None:
+        dsn["username"] = args.dsn_user
+    if args.dsn_password is not None:
+        dsn["password"] = args.dsn_password
+    if args.dsn_database:
+        dsn["database"] = args.dsn_database
+    if args.dsn_port is not None:
+        dsn["port"] = args.dsn_port
+
+    if args.dsn_host:
+        dsn["host"] = args.dsn_host
+    elif args.sync_dsn_ip or args.ip:
+        dsn["host"] = ip
+
+    opts = dsn.setdefault("options", {})
+    if args.clear_options:
+        opts.clear()
+    if args.remove_option:
+        for k in args.remove_option:
+            opts.pop(k, None)
+    if args.dsn_option:
+        opts.update(parse_kv_options(args.dsn_option))
+
+    return config
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Update and validate changeable IP, URL, and DSN options."
+    )
+    parser.add_argument("--config", type=Path, default=Path("endpoint_dsn_config.json"))
+    parser.add_argument("--schema", type=Path, default=None)
+    parser.add_argument("--ip", type=str, default=None, help="Change IP address")
+    parser.add_argument("--port", type=int, default=None, help="Change URL/endpoint port")
+    parser.add_argument("--url", type=str, default=None, help="Set or replace full URL")
+    parser.add_argument(
+        "--sync-url-ip",
+        action="store_true",
+        help="Rewrite URL host/port to match --ip/--port when --url is not set",
+    )
+
+    parser.add_argument("--dsn-driver", type=str, default=None, help="DSN driver (e.g., postgresql)")
+    parser.add_argument("--dsn-host", type=str, default=None, help="DSN host/IP override")
+    parser.add_argument(
+        "--sync-dsn-ip",
+        action="store_true",
+        help="Sync DSN host to --ip",
+    )
+    parser.add_argument("--dsn-port", type=int, default=None, help="DSN port")
+    parser.add_argument("--dsn-user", type=str, default=None, help="DSN username")
+    parser.add_argument("--dsn-password", type=str, default=None, help="DSN password")
+    parser.add_argument("--dsn-database", type=str, default=None, help="DSN database/path")
+    parser.add_argument(
+        "--dsn-option",
+        action="append",
+        default=[],
+        help="Add/update DSN option as key=value (repeatable)",
+    )
+    parser.add_argument(
+        "--remove-option",
+        action="append",
+        default=[],
+        help="Remove DSN option key (repeatable)",
+    )
+    parser.add_argument(
+        "--clear-options",
+        action="store_true",
+        help="Clear existing DSN options before applying new ones",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Write updated configuration back to --config file",
+    )
+
+    args = parser.parse_args()
+
+    schema = DEFAULT_SCHEMA
+    if args.schema and args.schema.exists():
+        schema = json.loads(args.schema.read_text(encoding="utf-8"))
+
+    if args.config.exists():
+        config = json.loads(args.config.read_text(encoding="utf-8"))
+    else:
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+
+    config = apply_overrides(config, args)
+    validate_config(config, schema)
+
+    dsn_uri = build_dsn_uri(config["dsn"])
+    digest = sha256_payload(config)
+
+    if args.save:
+        args.config.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    output = {
+        "ip_address": config["ip_address"],
+        "url": config["url"],
+        "dsn_uri": dsn_uri,
+        "dsn_options": config["dsn"].get("options", {}),
+        "sha256": digest,
+        "saved_to": str(args.config) if args.save else None,
+    }
+    print(json.dumps(output, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+3. Usage Examples
+Bash
+# Update IP (also updates DSN host) and add/modify DSN options, saving to file
+python endpoint_dsn_manager.py \
+  --ip 10.0.0.42 \
+  --url "https://10.0.0.42:8443/api/v1" \
+  --dsn-driver postgresql \
+  --dsn-database media_archive \
+  --dsn-option sslmode=require \
+  --dsn-option connect_timeout=5 \
+  --save
+
+# Swap a DSN option and remove an old one
+python endpoint_dsn_manager.py \
+  --dsn-option sslmode=disable \
+  --remove-option application_name \
+  --save
+Would you like to adapt this for a specific protocol (such as RTSP/HTTP camera streams or ODBC/SQLAlchemy connection strings) or export it into an existing project script?
